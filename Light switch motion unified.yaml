@@ -1,14 +1,4 @@
 blueprint:
-  name: "Light: switch + motion sensor (unified logic)"
-  description: >
-    A single automation covering the full logic:
-      - A physical switch (MQTT toggle) turns the light on/off and
-        sets/clears "manual mode".
-      - If the light is off, motion turns it on (but not sooner than
-        N minutes after a manual switch-off - block/debounce period).
-      - If the light was turned on by the sensor (not in manual mode),
-        it turns off M minutes after motion stops.
-      - If the light was turned on by the switch (manual mode), it turnsblueprint:
   name: "Light: Switch (Any) + Motion Sensor (Unified Logic)"
   description: >
     A single automation for the entire logic. The switch trigger is universal —
