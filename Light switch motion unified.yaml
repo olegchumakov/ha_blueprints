@@ -1,0 +1,288 @@
+blueprint:
+  name: "Light: switch + motion sensor (unified logic)"
+  description: >
+    A single automation covering the full logic:
+      - A physical switch (MQTT toggle) turns the light on/off and
+        sets/clears "manual mode".
+      - If the light is off, motion turns it on (but not sooner than
+        N minutes after a manual switch-off - block/debounce period).
+      - If the light was turned on by the sensor (not in manual mode),
+        it turns off M minutes after motion stops.
+      - If the light was turned on by the switch (manual mode), it turns
+        off K hours after the LAST motion event. If motion resumes before
+        that, the countdown restarts automatically. If motion never
+        occurred at all, the light will NOT turn off on its own - only
+        the switch can turn it off.
+
+    Before using this blueprint, create these helpers once via
+    Settings -> Devices & Services -> Helpers:
+      - input_boolean (manual mode flag)
+      - timer (used for TWO roles at different times: while manual mode
+        is on, it's the 2-hour timeout; while manual mode is off, it's
+        the 2-minute sensor block/debounce after a manual switch-off.
+        The two roles never overlap, so one timer is enough)
+
+  domain: automation
+
+  input:
+    motion_sensor:
+      name: "Motion sensor"
+      selector:
+        entity:
+          domain: binary_sensor
+
+    light_entity:
+      name: "Light"
+      selector:
+        entity:
+          domain: light
+
+    switch_topic:
+      name: "Switch MQTT topic"
+      description: "e.g. zigbee2mqtt/Toilet Switch/action"
+      selector:
+        text:
+
+    switch_payload:
+      name: "Toggle payload"
+      default: "single"
+      selector:
+        text:
+
+    manual_mode_boolean:
+      name: "Helper: manual mode flag (input_boolean)"
+      selector:
+        entity:
+          domain: input_boolean
+
+    shared_timer:
+      name: "Helper: shared timer (timer)"
+      description: "Used both for the 2h timeout and the 2min block period"
+      selector:
+        entity:
+          domain: timer
+
+    switch_block_minutes:
+      name: "Sensor block period after manual switch-off, minutes"
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 60
+          unit_of_measurement: minutes
+
+    auto_off_minutes:
+      name: "Auto mode: turn off after X minutes without motion"
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: minutes
+
+    manual_timeout:
+      name: "Manual mode: turn off X after the last motion event"
+      default: "02:00:00"
+      selector:
+        duration:
+
+mode: queued
+max: 20
+
+triggers:
+  - trigger: homeassistant
+    event: start
+    id: ha_started
+  - entity_id: !input motion_sensor
+    to: "on"
+    id: motion_on
+    trigger: state
+  - entity_id: !input motion_sensor
+    from: "on"
+    to: "off"
+    for:
+      minutes: !input auto_off_minutes
+    id: motion_off_auto_timeout
+    trigger: state
+  - entity_id: !input motion_sensor
+    from: "on"
+    to: "off"
+    id: motion_off_immediate
+    trigger: state
+  - topic: !input switch_topic
+    payload: !input switch_payload
+    trigger: mqtt
+    id: switch_toggle
+  - trigger: event
+    event_type: timer.finished
+    event_data:
+      entity_id: !input shared_timer
+    id: shared_timer_finished
+
+conditions: []
+
+variables:
+  light_entity: !input light_entity
+  motion_sensor: !input motion_sensor
+  manual_mode_boolean: !input manual_mode_boolean
+  shared_timer: !input shared_timer
+  switch_block_minutes: !input switch_block_minutes
+  manual_timeout: !input manual_timeout
+
+actions:
+  - choose:
+      # --- 0. HA restart: if manual mode was active, restore a fresh
+      #        full timeout (timers do not survive an HA restart) ---
+      - conditions:
+          - condition: trigger
+            id: ha_started
+          - condition: state
+            entity_id: !input manual_mode_boolean
+            state: "on"
+          - condition: template
+            value_template: "{{ is_state(light_entity, 'on') }}"
+        sequence:
+          - action: timer.start
+            target:
+              entity_id: !input shared_timer
+            data:
+              duration: "{{ manual_timeout }}"
+
+      # --- 1. Switch: toggle ---
+      - conditions:
+          - condition: trigger
+            id: switch_toggle
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ is_state(light_entity, 'off') }}"
+            then:
+              - action: light.turn_on
+                target:
+                  entity_id: !input light_entity
+              - action: input_boolean.turn_on
+                target:
+                  entity_id: !input manual_mode_boolean
+              - action: timer.cancel
+                target:
+                  entity_id: !input shared_timer
+            else:
+              - action: light.turn_off
+                target:
+                  entity_id: !input light_entity
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: !input manual_mode_boolean
+              - action: timer.cancel
+                target:
+                  entity_id: !input shared_timer
+              # if there's no motion right now, start the block period
+              # immediately; if there is, branch 4 will start it once
+              # motion actually stops
+              - if:
+                  - condition: template
+                    value_template: "{{ is_state(motion_sensor, 'off') }}"
+                then:
+                  - action: timer.start
+                    target:
+                      entity_id: !input shared_timer
+                    data:
+                      duration: "00:{{ '%02d' % (switch_block_minutes | int) }}:00"
+
+      # --- 2. Motion detected ---
+      - conditions:
+          - condition: trigger
+            id: motion_on
+          - condition: state
+            entity_id: !input manual_mode_boolean
+            state: "off"
+          - condition: template
+            value_template: "{{ is_state(light_entity, 'off') }}"
+        sequence:
+          - if:
+              # block period after switch-off is active -> just reset
+              # the countdown, do NOT turn the light on
+              - condition: template
+                value_template: "{{ is_state(shared_timer, 'active') }}"
+            then:
+              - action: timer.cancel
+                target:
+                  entity_id: !input shared_timer
+            else:
+              # no active block -> normal motion-triggered turn-on
+              - action: light.turn_on
+                target:
+                  entity_id: !input light_entity
+
+      # --- 3. Auto mode: turn off after X minutes without motion ---
+      - conditions:
+          - condition: trigger
+            id: motion_off_auto_timeout
+          - condition: template
+            value_template: "{{ is_state(light_entity, 'on') }}"
+          - condition: state
+            entity_id: !input manual_mode_boolean
+            state: "off"
+        sequence:
+          - action: light.turn_off
+            target:
+              entity_id: !input light_entity
+
+      # --- 4. Motion stopped: (re)start the shared timer ---
+      - conditions:
+          - condition: trigger
+            id: motion_off_immediate
+        sequence:
+          - choose:
+              # manual mode, light on -> this is the 2h timeout
+              - conditions:
+                  - condition: state
+                    entity_id: !input manual_mode_boolean
+                    state: "on"
+                  - condition: template
+                    value_template: "{{ is_state(light_entity, 'on') }}"
+                sequence:
+                  - action: timer.start
+                    target:
+                      entity_id: !input shared_timer
+                    data:
+                      duration: "{{ manual_timeout }}"
+              # not manual mode, light off -> this is the sensor block period
+              - conditions:
+                  - condition: state
+                    entity_id: !input manual_mode_boolean
+                    state: "off"
+                  - condition: template
+                    value_template: "{{ is_state(light_entity, 'off') }}"
+                sequence:
+                  - action: timer.start
+                    target:
+                      entity_id: !input shared_timer
+                    data:
+                      duration: "00:{{ '%02d' % (switch_block_minutes | int) }}:00"
+
+      # --- 5. Shared timer finished ---
+      - conditions:
+          - condition: trigger
+            id: shared_timer_finished
+        sequence:
+          - if:
+              # manual mode flag is on -> this was the 2h timeout
+              - condition: state
+                entity_id: !input manual_mode_boolean
+                state: "on"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ is_state(motion_sensor, 'off') }}"
+                  - condition: template
+                    value_template: "{{ is_state(light_entity, 'on') }}"
+                then:
+                  - action: light.turn_off
+                    target:
+                      entity_id: !input light_entity
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: !input manual_mode_boolean
+            # else: this was the sensor block period - it just expired,
+            # nothing to do, the sensor reacts normally again
